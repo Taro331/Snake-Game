@@ -74,6 +74,15 @@ function playPoisonHurt() {
   playTone({ frequency: 196, type: 'square', start: t + 0.06, duration: 0.1, peak: 0.14 })
 }
 
+/** 護盾抵擋時播放 */
+function playShieldBreak() {
+  if (sfxVolume.value <= 0) return
+  ensureContext()
+  const t = ctx.currentTime
+  playTone({ frequency: 880, type: 'sine', start: t, duration: 0.06, peak: 0.18 })
+  playTone({ frequency: 660, type: 'sine', start: t + 0.05, duration: 0.08, peak: 0.12 })
+}
+
 /** 玩家吃到食物時播放 */
 function playEat(kind) {
   if (sfxVolume.value <= 0) return
@@ -142,6 +151,7 @@ export function useGameAudio() {
     ensureContext,
     playEat,
     playPoisonHurt,
+    playShieldBreak,
     startBgm,
     stopBgm,
     dispose,

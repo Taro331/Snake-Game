@@ -12,6 +12,7 @@ const {
   ensureContext: ensureAudio,
   playEat,
   playPoisonHurt,
+  playShieldBreak,
   startBgm,
   stopBgm,
   dispose: disposeAudio,
@@ -19,7 +20,10 @@ const {
 
 const GRID = 20
 const TICK_MS = 120
-const OBSTACLE_INTERVAL_MS = 10000
+const DIRT_SPAWN_INTERVAL_MS = 10000
+const STUN_MS = 1500
+const PORTAL_COOLDOWN_SEC = 20
+const SHIELD_RESPAWN_MS = 25000
 const POISON_SHRINK = 2
 const MIN_SNAKE_LEN = 3
 const FOOD_COUNT = 3
@@ -59,7 +63,12 @@ const aiDir = ref({ dx: -1, dy: 0 })
 
 const foods = ref([])
 const poison = ref({ x: 5, y: 10 })
-const obstacles = ref([])
+const dirtBlocks = ref([])
+const portals = ref([])
+const portalCooldownSec = ref(0)
+const shieldPickup = ref(null)
+const hasShield = ref(false)
+const stunRemainingMs = ref(0)
 const score = ref(0)
 const aiScore = ref(0)
 const gameOver = ref(false)
@@ -67,7 +76,10 @@ const started = ref(false)
 const enableAi = ref(true)
 const aiDifficulty = ref('normal')
 let timer = null
-let obstacleTimer = null
+let dirtTimer = null
+let portalCooldownTimer = null
+let stunTimer = null
+let shieldRespawnTimer = null
 let aiMoveCooldown = 0
 
 const canChangeDifficulty = computed(() => !started.value || gameOver.value)
@@ -142,9 +154,22 @@ function isPoison(cell) {
   return poison.value.x === cell.x && poison.value.y === cell.y
 }
 
-function isObstacle(cell) {
-  return obstacles.value.some((o) => o.x === cell.x && o.y === cell.y)
+function isDirt(cell) {
+  return dirtBlocks.value.some((d) => d.x === cell.x && d.y === cell.y)
 }
+
+function isPortal(cell) {
+  return portals.value.some((p) => p.x === cell.x && p.y === cell.y)
+}
+
+function isShieldPickup(cell) {
+  const s = shieldPickup.value
+  return s && s.x === cell.x && s.y === cell.y
+}
+
+const stunSecondsLabel = computed(() =>
+  stunRemainingMs.value > 0 ? (stunRemainingMs.value / 1000).toFixed(1) : '',
+)
 
 const headFaceClass = computed(() => directionFaceClass(dir.value))
 
@@ -173,8 +198,20 @@ function isOutOfBounds(x, y) {
   return x < 0 || x >= GRID || y < 0 || y >= GRID
 }
 
-function isObstacleAt(x, y) {
-  return obstacles.value.some((o) => o.x === x && o.y === y)
+function isDirtAt(x, y) {
+  return dirtBlocks.value.some((d) => d.x === x && d.y === y)
+}
+
+function isPortalAt(x, y) {
+  return portals.value.some((p) => p.x === x && p.y === y)
+}
+
+function getPortalAt(x, y) {
+  return portals.value.find((p) => p.x === x && p.y === y) ?? null
+}
+
+function removeDirtAt(x, y) {
+  dirtBlocks.value = dirtBlocks.value.filter((d) => !(d.x === x && d.y === y))
 }
 
 function isPoisonAt(x, y) {
@@ -214,8 +251,22 @@ function blockedCells() {
   }
   foods.value.forEach((f) => set.add(posKey(f)))
   set.add(posKey(poison.value))
-  obstacles.value.forEach((o) => set.add(posKey(o)))
+  dirtBlocks.value.forEach((d) => set.add(posKey(d)))
+  portals.value.forEach((p) => set.add(posKey(p)))
+  if (shieldPickup.value) set.add(posKey(shieldPickup.value))
   return set
+}
+
+function randomEdgeCell(exclude) {
+  const candidates = []
+  for (let x = 0; x < GRID; x++) {
+    for (let y = 0; y < GRID; y++) {
+      if (x > 0 && x < GRID - 1 && y > 0 && y < GRID - 1) continue
+      if (!exclude.has(`${x},${y}`)) candidates.push({ x, y })
+    }
+  }
+  if (candidates.length === 0) return null
+  return candidates[randomInt(candidates.length)]
 }
 
 function randomEmptyCell(exclude = blockedCells()) {
@@ -251,9 +302,109 @@ function spawnPoison() {
   if (cell) poison.value = cell
 }
 
-function addObstacle() {
+function addDirtBlock() {
   const cell = randomEmptyCell()
-  if (cell) obstacles.value = [...obstacles.value, cell]
+  if (cell) dirtBlocks.value = [...dirtBlocks.value, cell]
+}
+
+function spawnPortals() {
+  if (portals.value.length > 0 || portalCooldownSec.value > 0) return
+  const exclude = blockedCells()
+  const a = randomEdgeCell(exclude)
+  if (!a) return
+  exclude.add(posKey(a))
+  const b = randomEdgeCell(exclude)
+  if (!b) return
+  const pairId = `pair-${Date.now()}`
+  portals.value = [
+    { id: 0, x: a.x, y: a.y, pairId },
+    { id: 1, x: b.x, y: b.y, pairId },
+  ]
+}
+
+function clearPortalsAndStartCooldown() {
+  portals.value = []
+  stopPortalCooldown()
+  portalCooldownSec.value = PORTAL_COOLDOWN_SEC
+  portalCooldownTimer = setInterval(() => {
+    portalCooldownSec.value -= 1
+    if (portalCooldownSec.value <= 0) {
+      stopPortalCooldown()
+      spawnPortals()
+    }
+  }, 1000)
+}
+
+function stopPortalCooldown() {
+  if (portalCooldownTimer != null) {
+    clearInterval(portalCooldownTimer)
+    portalCooldownTimer = null
+  }
+}
+
+function spawnShieldPickup() {
+  if (hasShield.value || shieldPickup.value) return
+  const cell = randomEmptyCell()
+  if (cell) shieldPickup.value = cell
+}
+
+function scheduleShieldRespawn() {
+  if (shieldRespawnTimer != null) clearTimeout(shieldRespawnTimer)
+  shieldRespawnTimer = setTimeout(() => {
+    shieldRespawnTimer = null
+    if (started.value && !gameOver.value) spawnShieldPickup()
+  }, SHIELD_RESPAWN_MS)
+}
+
+function applyPlayerStun() {
+  stopLoop()
+  stunRemainingMs.value = STUN_MS
+  if (stunTimer != null) clearInterval(stunTimer)
+  stunTimer = setInterval(() => {
+    stunRemainingMs.value = Math.max(0, stunRemainingMs.value - 100)
+    if (stunRemainingMs.value <= 0) {
+      if (stunTimer != null) clearInterval(stunTimer)
+      stunTimer = null
+      if (started.value && !gameOver.value) startLoop()
+    }
+  }, 100)
+}
+
+function applyPortalTeleport(nextBody, nx, ny, isPlayer) {
+  if (!isPlayer) return nextBody
+  const portal = getPortalAt(nx, ny)
+  if (!portal) return nextBody
+  const pair = portals.value.find(
+    (p) => p.pairId === portal.pairId && p.id !== portal.id,
+  )
+  if (!pair) return nextBody
+  const teleported = [{ x: pair.x, y: pair.y }, ...nextBody.slice(1)]
+  clearPortalsAndStartCooldown()
+  return teleported
+}
+
+function tryPickupShield(nx, ny) {
+  const s = shieldPickup.value
+  if (!s || s.x !== nx || s.y !== ny) return
+  hasShield.value = true
+  shieldPickup.value = null
+  scheduleShieldRespawn()
+}
+
+function finishPlayerMove(nextBody, nx, ny, isPlayer) {
+  let body = nextBody
+  if (isPlayer) {
+    tryPickupShield(nx, ny)
+    body = applyPortalTeleport(body, nx, ny, true)
+  } else {
+    const head = body[0]
+    body = applyPortalTeleport(body, head.x, head.y, false)
+  }
+  return {
+    ok: true,
+    body,
+    newHead: body[0],
+  }
 }
 
 function respawnAi() {
@@ -269,7 +420,8 @@ function respawnAi() {
       candidate.every(
         (p) =>
           !isOutOfBounds(p.x, p.y) &&
-          !isObstacleAt(p.x, p.y) &&
+          !isDirtAt(p.x, p.y) &&
+          !isPortalAt(p.x, p.y) &&
           !isPoisonAt(p.x, p.y) &&
           !occupiesSnake(snake.value, p.x, p.y, false) &&
           !isFoodAt(p.x, p.y),
@@ -305,12 +457,36 @@ function resetGame() {
   score.value = 0
   aiScore.value = 0
   gameOver.value = false
-  obstacles.value = []
+  dirtBlocks.value = []
+  portals.value = []
+  portalCooldownSec.value = 0
+  shieldPickup.value = null
+  hasShield.value = false
+  stunRemainingMs.value = 0
   foods.value = []
   aiMoveCooldown = 0
+  stopPortalCooldown()
+  stopStunTimer()
+  stopShieldRespawnTimer()
   initFoods()
   spawnPoison()
-  addObstacle()
+  addDirtBlock()
+  spawnPortals()
+  spawnShieldPickup()
+}
+
+function stopStunTimer() {
+  if (stunTimer != null) {
+    clearInterval(stunTimer)
+    stunTimer = null
+  }
+}
+
+function stopShieldRespawnTimer() {
+  if (shieldRespawnTimer != null) {
+    clearTimeout(shieldRespawnTimer)
+    shieldRespawnTimer = null
+  }
 }
 
 function setDifficulty(level) {
@@ -334,7 +510,7 @@ function shouldAiMoveThisTick() {
 }
 
 function canSnakeEnter(body, otherBody, x, y, willGrow) {
-  if (isOutOfBounds(x, y) || isObstacleAt(x, y)) return false
+  if (isOutOfBounds(x, y) || isDirtAt(x, y) || isPortalAt(x, y)) return false
   if (occupiesSnake(otherBody, x, y, false)) return false
   if (occupiesSnake(body, x, y, !willGrow)) return false
   return true
@@ -390,7 +566,7 @@ function moveSnake(body, direction, isPlayer) {
   const nx = head.x + direction.dx
   const ny = head.y + direction.dy
 
-  if (isOutOfBounds(nx, ny) || isObstacleAt(nx, ny)) {
+  if (isOutOfBounds(nx, ny)) {
     return { ok: false, reason: 'wall' }
   }
 
@@ -399,17 +575,47 @@ function moveSnake(body, direction, isPlayer) {
       ? aiSnake.value
       : []
     : snake.value
+
   if (other.length > 0 && occupiesSnake(other, nx, ny, false)) {
+    const hitOtherHead = other[0].x === nx && other[0].y === ny
+    if (isPlayer && hasShield.value && !hitOtherHead) {
+      hasShield.value = false
+      playShieldBreak()
+      const nextBody = [{ x: nx, y: ny }, ...body]
+      nextBody.pop()
+      return finishPlayerMove(nextBody, nx, ny, isPlayer)
+    }
     return { ok: false, reason: 'snake' }
   }
 
   const eaten = getFoodAt(nx, ny)
   const eatingFood = eaten != null
   const eatingPoison = isPoisonAt(nx, ny)
+  const hittingDirt = isDirtAt(nx, ny)
   const willGrow = eatingFood
 
   if (occupiesSnake(body, nx, ny, !willGrow)) {
     return { ok: false, reason: 'self' }
+  }
+
+  if (hittingDirt) {
+    if (isPlayer && hasShield.value) {
+      hasShield.value = false
+      playShieldBreak()
+      removeDirtAt(nx, ny)
+    } else if (isPlayer) {
+      const nextBody = [{ x: nx, y: ny }, ...body]
+      if (nextBody.length > MIN_SNAKE_LEN) nextBody.pop()
+      removeDirtAt(nx, ny)
+      playPoisonHurt()
+      applyPlayerStun()
+      return finishPlayerMove(nextBody, nx, ny, isPlayer)
+    } else {
+      const nextBody = [{ x: nx, y: ny }, ...body]
+      if (nextBody.length > MIN_SNAKE_LEN) nextBody.pop()
+      removeDirtAt(nx, ny)
+      return finishPlayerMove(nextBody, nx, ny, isPlayer)
+    }
   }
 
   const nextBody = [{ x: nx, y: ny }, ...body]
@@ -425,6 +631,12 @@ function moveSnake(body, direction, isPlayer) {
       aiScore.value += points
     }
   } else if (eatingPoison) {
+    if (isPlayer && hasShield.value) {
+      hasShield.value = false
+      playShieldBreak()
+      nextBody.pop()
+      return finishPlayerMove(nextBody, nx, ny, isPlayer)
+    }
     nextBody.pop()
     for (let i = 0; i < POISON_SHRINK && nextBody.length > MIN_SNAKE_LEN; i++) {
       nextBody.pop()
@@ -435,7 +647,7 @@ function moveSnake(body, direction, isPlayer) {
     nextBody.pop()
   }
 
-  return { ok: true, body: nextBody, newHead: { x: nx, y: ny } }
+  return finishPlayerMove(nextBody, nx, ny, isPlayer)
 }
 
 function stopLoop() {
@@ -445,20 +657,24 @@ function stopLoop() {
   }
 }
 
-function stopObstacleLoop() {
-  if (obstacleTimer != null) {
-    clearInterval(obstacleTimer)
-    obstacleTimer = null
+function stopDirtLoop() {
+  if (dirtTimer != null) {
+    clearInterval(dirtTimer)
+    dirtTimer = null
   }
 }
 
 function stopAllLoops() {
   stopLoop()
-  stopObstacleLoop()
+  stopDirtLoop()
+  stopPortalCooldown()
+  stopStunTimer()
+  stopShieldRespawnTimer()
 }
 
 function tick() {
   if (!started.value || gameOver.value) return
+  if (stunRemainingMs.value > 0) return
 
   const nd = nextDir.value
   const cur = dir.value
@@ -502,12 +718,12 @@ function startLoop() {
   timer = setInterval(tick, TICK_MS)
 }
 
-function startObstacleLoop() {
-  stopObstacleLoop()
-  obstacleTimer = setInterval(() => {
+function startDirtLoop() {
+  stopDirtLoop()
+  dirtTimer = setInterval(() => {
     if (!started.value || gameOver.value) return
-    addObstacle()
-  }, OBSTACLE_INTERVAL_MS)
+    addDirtBlock()
+  }, DIRT_SPAWN_INTERVAL_MS)
 }
 
 function start() {
@@ -515,7 +731,7 @@ function start() {
   started.value = true
   resetGame()
   startLoop()
-  startObstacleLoop()
+  startDirtLoop()
   startBgm()
 }
 
@@ -523,7 +739,7 @@ function restart() {
   ensureAudio()
   resetGame()
   startLoop()
-  startObstacleLoop()
+  startDirtLoop()
   startBgm()
 }
 
@@ -582,7 +798,7 @@ onUnmounted(() => {
   <div class="page">
     <header class="header">
       <h1 class="title">貪食蛇</h1>
-      <p class="subtitle">紅食 +1、金食 +3；橘色電腦蛇會搶食；紫毒縮短、灰牆障礙</p>
+      <p class="subtitle">紅食 +1、金食 +3；土塊、傳送門、護盾與電腦對戰</p>
     </header>
 
     <section class="panel">
@@ -590,7 +806,13 @@ onUnmounted(() => {
         <span>玩家：<strong>{{ score }}</strong></span>
         <span v-if="enableAi">電腦：<strong>{{ aiScore }}</strong></span>
         <span>食物：<strong>{{ foods.length }}</strong></span>
-        <span>障礙：<strong>{{ obstacles.length }}</strong></span>
+        <span>土塊：<strong>{{ dirtBlocks.length }}</strong></span>
+        <span v-if="hasShield" class="badge shield">護盾</span>
+        <span v-if="stunRemainingMs > 0" class="badge stun">僵直 {{ stunSecondsLabel }} 秒</span>
+        <span v-if="portalCooldownSec > 0" class="badge portal-cd">
+          傳送門 {{ portalCooldownSec }} 秒
+        </span>
+        <span v-else-if="portals.length === 2" class="badge portal-ready">傳送門就緒</span>
         <span v-if="started && !gameOver" class="badge muted">進行中</span>
         <span v-else-if="gameOver" class="badge danger">遊戲結束</span>
         <span v-else class="badge muted">尚未開始</span>
@@ -677,7 +899,7 @@ onUnmounted(() => {
 
     <div
       class="board"
-      :class="{ dim: gameOver }"
+      :class="{ dim: gameOver, stunned: stunRemainingMs > 0 }"
       role="application"
       aria-label="貪食蛇遊戲區域，共二十乘二十格"
     >
@@ -687,13 +909,16 @@ onUnmounted(() => {
         class="cell"
         :class="{
           head: isHead(cell),
+          shielded: isHead(cell) && hasShield,
           body: isBody(cell),
           'ai-head': isAiHead(cell),
           'ai-body': isAiBody(cell),
           food: isNormalFood(cell),
           'golden-food': isGoldenFood(cell),
           poison: isPoison(cell),
-          obstacle: isObstacle(cell),
+          dirt: isDirt(cell),
+          portal: isPortal(cell),
+          'shield-pickup': isShieldPickup(cell),
         }"
       >
         <div
@@ -735,7 +960,9 @@ onUnmounted(() => {
           <li>可選擇是否有電腦玩家搶食</li>
           <li>有電腦時，撞到電腦蛇或與其頭相撞會結束</li>
           <li>紫色毒藥會縮短身體</li>
-          <li>灰色障礙每 {{ OBSTACLE_INTERVAL_MS / 1000 }} 秒增加一個</li>
+          <li>棕色土塊：撞上縮短 1 格、僵直 1.5 秒，土塊消失；每 {{ DIRT_SPAWN_INTERVAL_MS / 1000 }} 秒增加一塊</li>
+          <li>地圖邊緣傳送門成對傳送，使用後消失，{{ PORTAL_COOLDOWN_SEC }} 秒後重生</li>
+          <li>青色護盾可抵擋一次土塊、毒藥或電腦蛇身；頭撞頭仍會結束</li>
         </ul>
       </div>
     </footer>
@@ -880,6 +1107,26 @@ onUnmounted(() => {
   color: #b91c1c;
 }
 
+.badge.shield {
+  background: #cffafe;
+  color: #0e7490;
+}
+
+.badge.stun {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.badge.portal-cd {
+  background: #ede9fe;
+  color: #6d28d9;
+}
+
+.badge.portal-ready {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -929,6 +1176,10 @@ onUnmounted(() => {
   opacity: 0.55;
 }
 
+.board.stunned {
+  filter: saturate(0.65);
+}
+
 .cell {
   border-radius: 4px;
   background: #1e293b;
@@ -947,6 +1198,12 @@ onUnmounted(() => {
 .cell.head {
   background: linear-gradient(145deg, #86efac, #22c55e);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+
+.cell.head.shielded {
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.45),
+    0 0 10px rgba(34, 211, 238, 0.85);
 }
 
 .cell.ai-head {
@@ -1035,9 +1292,30 @@ onUnmounted(() => {
   box-shadow: 0 0 8px rgba(167, 139, 250, 0.75);
 }
 
-.cell.obstacle {
-  background: linear-gradient(145deg, #64748b, #334155);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+.cell.dirt {
+  background: linear-gradient(145deg, #d6b48a, #92400e);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+}
+
+.cell.portal {
+  background: radial-gradient(circle at 40% 35%, #a5f3fc, #0284c7);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.85);
+  animation: portal-pulse 1.2s ease-in-out infinite;
+}
+
+.cell.shield-pickup {
+  background: radial-gradient(circle at 35% 30%, #a5f3fc, #0891b2);
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.8);
+}
+
+@keyframes portal-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.72;
+  }
 }
 
 .help {
